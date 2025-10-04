@@ -591,6 +591,7 @@ export default {
       permissionCode: '',
       paidMark: false,
       myappActivation: false,
+      myappLicense: null,
       permissionInfo: null,
       isShowUserProfile: false,
 
@@ -613,10 +614,10 @@ export default {
   computed: {
     isPro() {
       const legacy = !!this.permissionCode
-      const paid = this.paidMark === true
-      const activated = this.myappActivation === true
-      const statusActive = this.permissionInfo && this.permissionInfo.status === 'active'
-      return legacy || paid || activated || statusActive
+      const licenseActive =
+        this.paidMark === true && this.myappActivation === true && !!this.myappLicense
+      const permissionInfoActive = this.isPermissionInfoActive()
+      return legacy || licenseActive || permissionInfoActive
     },
     permissionText() {
       return this.isPro ? 'Pro' : 'Free'
@@ -652,6 +653,82 @@ export default {
     }
   },
   methods: {
+    isStoredLicenseActive() {
+      return this.paidMark === true && this.myappActivation === true && !!this.myappLicense
+    },
+    isPermissionInfoActive() {
+      if (!this.permissionInfo) {
+        return false
+      }
+      if (this.permissionInfo.status === 'active') {
+        return true
+      }
+      if ('transaction_id' in this.permissionInfo) {
+        const currentTimestamp = parseInt(new Date().setDate(new Date().getDate() - 1) / 1000)
+        if (
+          typeof this.permissionInfo.expiration_time === 'number' &&
+          currentTimestamp < this.permissionInfo.expiration_time &&
+          this.permissionInfo.pay_status !== 1
+        ) {
+          return true
+        }
+      }
+      return false
+    },
+    determinePermissionCode(storedPermissionCode) {
+      const licenseActive = this.isStoredLicenseActive()
+      const permissionInfoActive = this.isPermissionInfoActive()
+      if (!licenseActive && !permissionInfoActive) {
+        return ''
+      }
+      if (permissionInfoActive && this.permissionInfo && this.permissionInfo.plink_id) {
+        return this.permissionInfo.plink_id
+      }
+      if (storedPermissionCode) {
+        return storedPermissionCode
+      }
+      return 'supabase_pro'
+    },
+    async persistPermissionCode(value) {
+      if (!(chrome && chrome.storage && chrome.storage.local && chrome.storage.local.set)) {
+        return
+      }
+      const normalized = value || ''
+      await new Promise((resolve) => {
+        try {
+          chrome.storage.local.set({ permissionCode: normalized }, () => resolve())
+        } catch (error) {
+          console.error('[Permission] persist permissionCode failed', error)
+          resolve()
+        }
+      })
+    },
+    async fetchPermissionSnapshot(additionalKeys = []) {
+      const baseKeys = [
+        'paid_mark',
+        'myapp_activation',
+        'myapp_license',
+        'permissionInfo',
+        'permissionCode'
+      ]
+      const keys = [...new Set([...baseKeys, ...additionalKeys])]
+      return await new Promise((resolve) => {
+        chrome.storage.local.get(keys, (res) => resolve(res))
+      })
+    },
+    async applyPermissionState(storage = {}) {
+      this.paidMark = !!storage.paid_mark
+      this.myappActivation = !!storage.myapp_activation
+      this.myappLicense = storage.myapp_license || null
+      this.permissionInfo = storage.permissionInfo || null
+      const nextPermissionCode = this.determinePermissionCode(storage.permissionCode)
+      if (this.permissionCode !== nextPermissionCode) {
+        this.permissionCode = nextPermissionCode
+      }
+      if (storage.permissionCode !== nextPermissionCode) {
+        await this.persistPermissionCode(nextPermissionCode)
+      }
+    },
     /**
      * @description: 赋予免费用户试用权限
      * @return {*}
@@ -699,16 +776,10 @@ export default {
     async changePermissionCode(permissionCode, transaction_id, whatsappNumber) {
       if (permissionCode) {
         this.permissionCode = permissionCode
+        await this.persistPermissionCode(this.permissionCode)
       } else {
-        const shouldMarkPro =
-          this.paidMark === true ||
-          this.myappActivation === true ||
-          (this.permissionInfo && this.permissionInfo.status === 'active')
-        if (shouldMarkPro && !this.permissionCode) {
-          this.permissionCode = 'supabase_pro'
-        } else if (!shouldMarkPro && this.permissionCode === 'supabase_pro') {
-          this.permissionCode = ''
-        }
+        const snapshot = await this.fetchPermissionSnapshot()
+        await this.applyPermissionState(snapshot)
       }
       const tab = await chrome.tabs.query({
         active: true,
@@ -1384,48 +1455,23 @@ export default {
       this.parentNode.removeChild(this)
     }
     document.head.appendChild(temp)
+    const initialStorage = await this.fetchPermissionSnapshot([
+      'BulkSender_isGuide',
+      'BulkSender_btnMsg'
+    ])
+    await this.applyPermissionState(initialStorage)
     let _This = this
-    await new Promise((resolve) => {
-      chrome.storage.local.get(
-        ['BulkSender_isGuide', 'BulkSender_btnMsg', 'permissionInfo', 'paid_mark', 'myapp_activation'],
-        function (res) {
-          _This.paidMark = !!res.paid_mark
-          _This.myappActivation = !!res.myapp_activation
-          _This.permissionInfo = res.permissionInfo || null
-          const shouldMarkPro =
-            _This.paidMark === true ||
-            _This.myappActivation === true ||
-            (_This.permissionInfo && _This.permissionInfo.status === 'active')
-          if (!_This.permissionCode && shouldMarkPro) {
-            _This.permissionCode = 'supabase_pro'
-          } else if (!shouldMarkPro && _This.permissionCode === 'supabase_pro') {
-            _This.permissionCode = ''
-          }
-          // 获取权限信息
-          if (_This.permissionInfo && 'transaction_id' in _This.permissionInfo) {
-            const currentTimestamp = parseInt(new Date().setDate(new Date().getDate() - 1) / 1000)
-            if (
-              currentTimestamp < _This.permissionInfo['expiration_time'] &&
-              _This.permissionInfo['pay_status'] !== 1
-            ) {
-              _This.permissionCode = _This.permissionInfo['plink_id']
-            }
-          }
-          if (res.BulkSender_isGuide === false) {
-            _This.isGuide = false
-            if (res.BulkSender_btnMsg === false) {
-              _This.buttonMsgDialogVisible = false
-            } else {
-              _This.buttonMsgDialogVisible = true
-            }
-          } else {
-            _This.isGuide = true
-          }
-          resolve('')
-          _This.grantTrialPermission()
-        }
-      )
-    })
+    if (initialStorage.BulkSender_isGuide === false) {
+      _This.isGuide = false
+      if (initialStorage.BulkSender_btnMsg === false) {
+        _This.buttonMsgDialogVisible = false
+      } else {
+        _This.buttonMsgDialogVisible = true
+      }
+    } else {
+      _This.isGuide = true
+    }
+    this.grantTrialPermission()
 
     this.browserType = getBrowser()['browser']
     chrome.tabs.query({ active: true, currentWindow: true }, function (tab) {
@@ -1718,32 +1764,19 @@ export default {
   },
   async mounted() {
     let _This = this
-    this._storageChangeHandler = (changes, area) => {
+    this._storageChangeHandler = async (changes, area) => {
       if (area !== 'local') return
-      let touched = false
-      if (changes.paid_mark) {
-        this.paidMark = !!changes.paid_mark.newValue
-        touched = true
-      }
-      if (changes.myapp_activation) {
-        this.myappActivation = !!changes.myapp_activation.newValue
-        touched = true
-      }
-      if (changes.permissionInfo) {
-        this.permissionInfo = changes.permissionInfo.newValue || null
-        touched = true
-      }
-      if (touched) {
-        const shouldMarkPro =
-          this.paidMark === true ||
-          this.myappActivation === true ||
-          (this.permissionInfo && this.permissionInfo.status === 'active')
-        if (!this.permissionCode && shouldMarkPro) {
-          this.permissionCode = 'supabase_pro'
-        } else if (!shouldMarkPro && this.permissionCode === 'supabase_pro') {
-          this.permissionCode = ''
-        }
-      }
+      const relevantKeys = [
+        'paid_mark',
+        'myapp_activation',
+        'myapp_license',
+        'permissionInfo',
+        'permissionCode'
+      ]
+      const touched = relevantKeys.some((key) => key in changes)
+      if (!touched) return
+      const snapshot = await this.fetchPermissionSnapshot()
+      await this.applyPermissionState(snapshot)
     }
     chrome.storage.onChanged.addListener(this._storageChangeHandler)
     this.$bridge.onMessage(CONTENT_TO_POP_IS_SHOW_NO_ACTIVE, ({ data }) => {
